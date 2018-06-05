@@ -28,19 +28,11 @@ require 'open3'
 module OpenProject::TextFormatting::Formatters
   module Markdown
     class TextileConverter
-      attr_reader :src, :dst
-
-      def initialize
-      end
-
-
       def run!
         puts 'Starting conversion of Textile fields to CommonMark+GFM.'
 
         ActiveRecord::Base.transaction do
-          converters.each do |handler|
-            handler.call
-          end
+          converters.each(&:call)
         end
 
         puts "\n-- Completed --"
@@ -76,16 +68,21 @@ module OpenProject::TextFormatting::Formatters
           print "#{the_class.name} "
 
           # Iterate in batches to avoid plucking too much
-          the_class.in_batches(of: 200) do |relation|
+          batches_of_objects_to_convert(the_class, attributes) do |relation|
+            new_values = []
             relation.pluck(:id, *attributes).each do |values|
               # Zip converted texts into
               # { attr_a: textile, ... }
               converted = values.drop(1).map(&method(:convert_textile_to_markdown))
-              update_hash = Hash[attributes.zip(converted)]
-              the_class.where(id: values.first).update_all(update_hash)
+
+              new_values << { id: values[0] }.merge(attributes.zip(converted).to_hash)
 
               print '.'
             end
+
+            next if new_values.empty?
+
+            ActiveRecord::Base.connection.execute(batch_update_statement(the_class, attributes, new_values))
           end
           puts 'done'
         end
@@ -102,7 +99,7 @@ module OpenProject::TextFormatting::Formatters
         end
 
         puts 'done'
-    end
+      end
 
       def convert_textile_to_markdown(textile)
         return '' unless textile.present?
@@ -177,22 +174,73 @@ module OpenProject::TextFormatting::Formatters
         {
           ::Announcement => [:text],
           ::AttributeHelpText => [:help_text],
-          ::Comment => [:text],
+          ::Comment => [:comments],
           ::WikiContent => [:text],
           ::WorkPackage =>  [:description],
           ::Message => [:content],
           ::News => [:description],
           ::Project => [:description],
           ::Journal => [:notes],
-          ::Journal::AttachmentJournal => [:description],
           ::Journal::MessageJournal => [:content],
           ::Journal::WikiContentJournal => [:text],
-          ::Journal::WorkPackageJournal => [:description],
-          ## TODO
-          # Documents
-          # ::Document => [:description],
-          # Meetings
+          ::Journal::WorkPackageJournal => [:description]
         }
+      end
+
+      def batches_of_objects_to_convert(klass, attributes)
+        scopes = attributes.map { |attribute| klass.where.not(attribute => nil).where.not(attribute => '') }
+
+        scope = scopes.shift
+        scopes.each do |attribute_scope|
+          scope = scope.or(attribute_scope)
+        end
+
+        # Iterate in batches to avoid plucking too much
+        scope.in_batches(of: 200) do |relation|
+          yield relation
+        end
+      end
+
+      def batch_update_statement(klass, attributes, values)
+        if OpenProject::Database.mysql?
+
+        else
+          batch_update_statement_postgresql(klass, attributes, values)
+        end
+      end
+
+      def batch_update_statement_postgresql(klass, attributes, values)
+        sets = attributes.map { |a| "#{a} = new_values.#{a}" }.join(', ')
+        new_values = values.map do |value_hash|
+          text_values = value_hash.except(:id).each_value { |v| ActiveRecord::Base.connection.quote(v) }.join(', ')
+          "(#{value_hash[:id]}, #{text_values}"
+        end
+
+        <<-SQL
+          UPDATE #{klass.table_name}
+          SET
+            #{sets}
+          FROM (
+            VALUES
+             #{new_values.join(', ')}
+          ) AS new_values (id, #{attributes.join(', ')})
+          WHERE #{klass.table_name}.id = new_values.id
+        SQL
+      end
+
+      def batch_update_statement_mysql(klass, attributes, values)
+        sets = attributes.map { |a| "#{a} = new_values.#{a}" }.join(', ')
+        new_values_union = values.map do |value_hash|
+          text_values = value_hash.except(:id).each { |k, v| "#{ActiveRecord::Base.connection.quote(v)} AS #{k}" }.join(', ')
+          "SELECT #{value_hash[:id]} AS id, #{text_values}"
+        end.join(' UNION ')
+
+        <<-SQL
+          UPDATE #{klass.table_name}, (#{new_values_union}) AS new_values
+          SET
+            #{sets}
+          WHERE #{klass.table_name}.id = new_values.id
+        SQL
       end
     end
   end
